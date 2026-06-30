@@ -10,6 +10,7 @@
 #include "../../../../config/ConfigValue.hpp"
 #include "../../../../config/shared/workspace/WorkspaceRuleManager.hpp"
 #include "../../../../render/Renderer.hpp"
+#include "../../../../state/WorkspaceState.hpp"
 #include "../../../../state/MonitorState.hpp"
 #include "../../../../managers/input/InputManager.hpp"
 #include "../../../../managers/PointerManager.hpp"
@@ -2099,6 +2100,7 @@ Config::ErrorResult CScrollingAlgorithm::layoutMsg(const std::string_view& sv) {
 
         const auto pNeighborTarget = pNeighborTargetData ? pNeighborTargetData->target.lock() : nullptr;
         this->focusTargetUpdate(pNeighborTarget);
+
 
         auto pTargetWS = State::workspaceState()->query().id(PARSED_WS.id).run();
         if (!pTargetWS) {
