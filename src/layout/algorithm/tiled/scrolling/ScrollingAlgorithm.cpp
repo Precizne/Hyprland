@@ -2024,6 +2024,173 @@ Config::ErrorResult CScrollingAlgorithm::layoutMsg(const std::string_view& sv) {
 
         m_scrollingData->SScrollingData::centerOrFitCol(WDATA->column.lock());
         m_scrollingData->recalculate();
+    } else if (ARGS[0] == "move_col_to_ws") {
+        // Move entire column to specified workspace
+
+        const std::string targetString = ARGS[1];
+        if (targetString.empty())
+            return invalidArg("not enough args: expected target workspace");
+
+        bool bFollow = true;
+        const std::string followString = ARGS[2];
+        if (!followString.empty()) {
+            bFollow = (followString == "1" || followString == "true" || followString == "yes");
+            if (!bFollow)
+                return invalidArg("incorrect args: expected true or false");
+        }
+
+        if (!m_scrollingData || !m_scrollingData->controller)
+            return stateErr("no scrolling data");
+
+        const auto PARSED_WS = getWorkspaceIDNameFromString(targetString);
+        if (PARSED_WS.id == WORKSPACE_INVALID)
+            return invalidArg("invalid target workspace: " + targetString);
+
+        const auto PCURRENT_SPACE = m_parent ? m_parent->space() : nullptr;
+        const auto PCURRENT_WS = PCURRENT_SPACE ? PCURRENT_SPACE->workspace() : nullptr;
+        if (!PCURRENT_WS || PCURRENT_WS->m_id == WORKSPACE_INVALID)
+            return stateErr("no current workspace");
+
+        if (PCURRENT_WS->m_id == PARSED_WS.id)
+            return {};
+
+        const auto PCURRENT_COL = currentColumn();
+        if (!PCURRENT_COL)
+            return {};
+
+        struct SNode {
+            PHLWINDOW pWindow;
+            float size;
+            bool wasFocused;
+        };
+        std::vector<SNode> layoutNodes;
+        layoutNodes.reserve(PCURRENT_COL->targetDatas.size());
+
+        const float COL_WIDTH = PCURRENT_COL->getColumnWidth();
+        const auto LAST_FOCUSED_TARGET = PCURRENT_COL->lastFocusedTarget.lock();
+        const auto LAST_FOCUSED_WINDOW = Desktop::focusState()->window();
+
+        for (const auto& targetData : PCURRENT_COL->targetDatas) {
+            const auto pTarget = targetData ? targetData->target.lock() : nullptr;
+            const auto pWindow = pTarget ? pTarget->window() : nullptr;
+            if (!pWindow)
+                continue;
+
+            layoutNodes.push_back({
+                .pWindow = pWindow,
+                .size = PCURRENT_COL->getTargetSize(targetData),
+                .wasFocused = (targetData == LAST_FOCUSED_TARGET) || (pWindow == LAST_FOCUSED_WINDOW)
+            });
+        }
+
+        if (layoutNodes.empty())
+            return {};
+
+        auto pNeighborCol = m_scrollingData->next(PCURRENT_COL);
+        if (!pNeighborCol)
+            pNeighborCol = m_scrollingData->prev(PCURRENT_COL);
+
+        SP<SScrollingTargetData> pNeighborTargetData;
+        if (pNeighborCol) {
+            pNeighborTargetData = pNeighborCol->lastFocusedTarget.lock();
+            if (!pNeighborTargetData && !pNeighborCol->targetDatas.empty())
+                pNeighborTargetData = pNeighborCol->targetDatas.front();
+        }
+
+        const auto pNeighborTarget = pNeighborTargetData ? pNeighborTargetData->target.lock() : nullptr;
+        this->focusTargetUpdate(pNeighborTarget);
+
+        auto pTargetWS = State::workspaceState()->query().id(PARSED_WS.id).run();
+        if (!pTargetWS) {
+            const auto pMonitor = PCURRENT_WS->m_monitor.lock();
+            if (!pMonitor)
+                return stateErr("current workspace not attached to monitor");
+
+            pTargetWS = CWorkspace::create(PARSED_WS.id, pMonitor, PARSED_WS.name);
+        }
+
+        for (const auto& layoutNode : layoutNodes) {
+            g_pCompositor->moveWindowToWorkspaceSafe(layoutNode.pWindow, pTargetWS);
+        }
+
+        const auto pTargetSpace = pTargetWS ? pTargetWS->m_space : nullptr;
+        const auto pTargetAlgo = pTargetSpace ? pTargetSpace->algorithm() : nullptr;
+        const auto pTiledAlgo = pTargetAlgo ? dynamic_cast<CScrollingAlgorithm*>(pTargetAlgo->tiledAlgo().get()) : nullptr;
+        if (!pTiledAlgo) {
+            m_scrollingData->recalculate();
+            return {};
+        }
+
+        auto pScrollingData = pTiledAlgo->m_scrollingData;
+        if (!pScrollingData)
+            return stateErr("no target scrolling data");
+
+        struct SMigratedNodes {
+            SP<SScrollingTargetData> pTargetData;
+            float size;
+            bool wasFocused;
+        };
+        std::vector<SMigratedNodes> migratedNodes;
+        for (const auto& layoutNode : layoutNodes) {
+            auto pTarget = layoutNode.pWindow->layoutTarget();
+            auto pTargetData = pTarget ? pTiledAlgo->dataFor(pTarget) : nullptr;
+            if (!pTargetData)
+                continue;
+
+            migratedNodes.push_back({
+                .pTargetData = pTargetData,
+                .size = layoutNode.size,
+                .wasFocused = layoutNode.wasFocused
+            });
+        }
+
+        for (const auto& migratedNode : migratedNodes) {
+            auto pTargetCol = migratedNode.pTargetData ? migratedNode.pTargetData->column.lock() : nullptr;
+            if (!pTargetCol)
+                continue;
+
+            pTargetCol->remove(migratedNode.pTargetData->target.lock());
+        }
+
+        auto pNewCol = pScrollingData->add(std::optional<float> { COL_WIDTH });
+        SP<SScrollingTargetData> pFocusedTargetData;
+
+        for (const auto& migratedNode : migratedNodes) {
+            pNewCol->add(migratedNode.pTargetData);
+
+            if (migratedNode.wasFocused || !pFocusedTargetData)
+                pFocusedTargetData = migratedNode.pTargetData;
+        }
+
+        for (const auto& migratedNode : migratedNodes) {
+            pNewCol->setTargetSize(migratedNode.pTargetData, migratedNode.size);
+        }
+
+        if (pFocusedTargetData)
+            pNewCol->lastFocusedTarget = pFocusedTargetData;
+
+        const auto pFocusedTarget = pFocusedTargetData ? pFocusedTargetData->target.lock() : nullptr;
+        const auto pTargetWindow = pFocusedTarget ? pFocusedTarget->window() : nullptr;
+        pTiledAlgo->focusTargetUpdate(pFocusedTarget);
+
+        if (bFollow) {
+            const auto pTargetMonitor = pTargetWS->m_monitor.lock();
+            if (pTargetMonitor->m_activeWorkspace != pTargetWS)
+                pTargetMonitor->changeWorkspace(pTargetWS->m_id);
+
+            if (pTargetWindow)
+                g_pCompositor->warpCursorTo(pTargetWindow->middle());
+        }
+        else {
+            const auto pNeighborWindow = pNeighborTarget ? pNeighborTarget->window() : nullptr;
+            if (pNeighborWindow)
+                g_pCompositor->warpCursorTo(pNeighborWindow->middle());
+        }
+
+        m_scrollingData->centerOrFitCol(pNeighborCol);
+        m_scrollingData->recalculate();
+        pScrollingData->centerOrFitCol(pNewCol);
+        pScrollingData->recalculate();
     }
 
     else
