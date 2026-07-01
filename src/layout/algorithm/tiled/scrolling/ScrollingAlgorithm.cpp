@@ -2032,12 +2032,13 @@ Config::ErrorResult CScrollingAlgorithm::layoutMsg(const std::string_view& sv) {
         if (targetString.empty())
             return invalidArg("not enough args: expected target workspace");
 
-        bool bFollow = true;
+        bool bFollow = false;
         const std::string followString = ARGS[2];
         if (!followString.empty()) {
-            bFollow = (followString == "1" || followString == "true" || followString == "yes");
-            if (!bFollow)
+            if (followString != "false" && followString != "true")
                 return invalidArg("incorrect args: expected true or false");
+
+            bFollow = (followString == "true");
         }
 
         if (!m_scrollingData || !m_scrollingData->controller)
@@ -2099,9 +2100,14 @@ Config::ErrorResult CScrollingAlgorithm::layoutMsg(const std::string_view& sv) {
         }
 
         const auto pNeighborTarget = pNeighborTargetData ? pNeighborTargetData->target.lock() : nullptr;
-        this->focusTargetUpdate(pNeighborTarget);
+        const auto pNeighborWindow = pNeighborTarget ? pNeighborTarget->window() : nullptr;
+        if (pNeighborWindow) {
+            this->focusTargetUpdate(pNeighborTarget);
+            g_pCompositor->warpCursorTo(pNeighborWindow->middle());
+            m_scrollingData->centerOrFitCol(pNeighborCol);
+        }
 
-
+        // TODO: START: Write a "Migration Handler"
         auto pTargetWS = State::workspaceState()->query().id(PARSED_WS.id).run();
         if (!pTargetWS) {
             const auto pMonitor = PCURRENT_WS->m_monitor.lock();
@@ -2111,21 +2117,26 @@ Config::ErrorResult CScrollingAlgorithm::layoutMsg(const std::string_view& sv) {
             pTargetWS = CWorkspace::create(PARSED_WS.id, pMonitor, PARSED_WS.name);
         }
 
-        for (const auto& layoutNode : layoutNodes) {
-            g_pCompositor->moveWindowToWorkspaceSafe(layoutNode.pWindow, pTargetWS);
-        }
-
         const auto pTargetSpace = pTargetWS ? pTargetWS->m_space : nullptr;
         const auto pTargetAlgo = pTargetSpace ? pTargetSpace->algorithm() : nullptr;
-        const auto pTiledAlgo = pTargetAlgo ? dynamic_cast<CScrollingAlgorithm*>(pTargetAlgo->tiledAlgo().get()) : nullptr;
+        const auto pTiledAlgo = pTargetAlgo ? dynamic_cast<CScrollingAlgorithm*>(pTargetAlgo->tiledAlgo().get()) : nullptr; // WARN: Bruhhh....
         if (!pTiledAlgo) {
-            m_scrollingData->recalculate();
             return {};
         }
 
         auto pScrollingData = pTiledAlgo->m_scrollingData;
         if (!pScrollingData)
             return stateErr("no target scrolling data");
+
+        // WARN: WTF am I even doing ATP??
+        const auto pLastFocusedWindow = pTargetWS ? pTargetWS->getLastFocusedWindow() : nullptr;
+        const auto pLastFocusedTarget = pLastFocusedWindow ? pLastFocusedWindow->layoutTarget() : nullptr;
+        const auto pLastFocusedTargetData = pTiledAlgo->dataFor(pLastFocusedTarget);
+        const auto pLastFocusedColumn = pLastFocusedTargetData ? pLastFocusedTargetData->column.lock() : nullptr;
+
+        for (const auto& layoutNode : layoutNodes) {
+            g_pCompositor->moveWindowToWorkspaceSafe(layoutNode.pWindow, pTargetWS);
+        }
 
         struct SMigratedNodes {
             SP<SScrollingTargetData> pTargetData;
@@ -2171,28 +2182,26 @@ Config::ErrorResult CScrollingAlgorithm::layoutMsg(const std::string_view& sv) {
         if (pFocusedTargetData)
             pNewCol->lastFocusedTarget = pFocusedTargetData;
 
-        const auto pFocusedTarget = pFocusedTargetData ? pFocusedTargetData->target.lock() : nullptr;
-        const auto pTargetWindow = pFocusedTarget ? pFocusedTarget->window() : nullptr;
-        pTiledAlgo->focusTargetUpdate(pFocusedTarget);
-
         if (bFollow) {
-            const auto pTargetMonitor = pTargetWS->m_monitor.lock();
-            if (pTargetMonitor->m_activeWorkspace != pTargetWS)
-                pTargetMonitor->changeWorkspace(pTargetWS->m_id);
+            const auto pFocusedTarget = pFocusedTargetData ? pFocusedTargetData->target.lock() : nullptr;
+            const auto pTargetWindow = pFocusedTarget ? pFocusedTarget->window() : nullptr;
 
-            if (pTargetWindow)
-                g_pCompositor->warpCursorTo(pTargetWindow->middle());
+            if (pTargetWindow) {
+                pTiledAlgo->focusTargetUpdate(pFocusedTarget);
+                g_pCompositor->warpCursorTo(pTargetWindow->middle()); // TODO: Fix this dumbo
+                pScrollingData->centerOrFitCol(pNewCol);
+            }
         }
         else {
-            const auto pNeighborWindow = pNeighborTarget ? pNeighborTarget->window() : nullptr;
-            if (pNeighborWindow)
-                g_pCompositor->warpCursorTo(pNeighborWindow->middle());
+            if (pLastFocusedColumn) {
+                pScrollingData->centerOrFitCol(pLastFocusedColumn);
+            }
         }
 
-        m_scrollingData->centerOrFitCol(pNeighborCol);
-        m_scrollingData->recalculate();
-        pScrollingData->centerOrFitCol(pNewCol);
         pScrollingData->recalculate();
+        // TODO: END: Write a "Migration Handler"
+
+        m_scrollingData->recalculate();
     }
 
     else
